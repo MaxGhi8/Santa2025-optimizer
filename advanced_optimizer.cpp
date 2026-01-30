@@ -1,5 +1,6 @@
 // Advanced Optimizer - SA + Back Propagation + Global Rotation + Earthquake
-// Compile: g++ -O3 -march=native -std=c++17 -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp -o advanced_optimizer advanced_optimizer.cpp
+// Compile: g++ -O3 -march=native -std=c++17 -fopenmp -o advanced_optimizer advanced_optimizer.cpp
+// Run: ./advanced_optimizer -iter 200000 --earthquake 5
 
 #include <iostream>
 #include <vector>
@@ -381,7 +382,7 @@ Cfg earthquake(Cfg c, double strength, FastRNG& rng) {
     c.updAll();
     
     // Try to fix overlaps by pushing trees outward
-    for (int iter = 0; iter < 200; iter++) {
+    for (int iter = 0; iter < 1000; iter++) {
         bool fixed = true;
         for (int i = 0; i < c.n; i++) {
             if (c.hasOvl(i)) {
@@ -484,15 +485,17 @@ void saveCSV(const string& fn, const map<int, Cfg>& cfg) {
 }
 
 int main(int argc, char** argv) {
-    string inputFile = "submission.csv";
-    string outputFile = "optimized.csv";
-    int iterations = 100000;
+    string inputFile = "../best_solution.csv";
+    string outputFile = "../submission.csv";
+    int iterations = 1000000;
     bool doBackProp = true;
-    int earthquakeRounds = 0;
+    int earthquakeRounds = 3;
     double startTemp = 10.0;
     double endTemp = 0.0001;
-    double baseStrength = 1.0;
-    
+    double baseStrength = 1.5;
+    int targetGroup = -1;
+    int numRestarts = 0;
+
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
         if (a == "-i" && i+1 < argc) inputFile = argv[++i];
@@ -500,15 +503,27 @@ int main(int argc, char** argv) {
         else if ((a == "-n" || a == "-iter") && i+1 < argc) iterations = stoi(argv[++i]);
         else if (a == "--no-backprop") doBackProp = false;
         else if ((a == "--earthquake" || a == "-earthquake") && i+1 < argc) earthquakeRounds = stoi(argv[++i]);
-        else if (a == "-t0" && i+1 < argc) startTemp = stod(argv[++i]);
+        else if ((a == "-t0" || a == "-t") && i+1 < argc) startTemp = stod(argv[++i]); // Added -t alias
         else if (a == "-tmin" && i+1 < argc) endTemp = stod(argv[++i]);
         else if ((a == "-s" || a == "-strength") && i+1 < argc) baseStrength = stod(argv[++i]);
+        else if ((a == "-g" || a == "--group") && i+1 < argc) targetGroup = stoi(argv[++i]); // Added -g
+        else if ((a == "-r" || a == "--restarts") && i+1 < argc) numRestarts = stoi(argv[++i]); // Added -r
     }
     
+    // Adjust threading if running single group
     int numThreads = omp_get_max_threads();
+    if (targetGroup != -1) {
+       // If optimizing a single group, we might want to use threads for restarts if implemented, 
+       // but here the loop structure is over groups. 
+       // If simple, we keep the parallel loop but filter.
+       // Or better, we just process that one group.
+    }
+
     printf("Advanced Optimizer (SA + Global Rotation + Back Prop + Earthquake)\n");
     printf("OpenMP: %d threads\n", numThreads);
     printf("Input: %s, Output: %s\n", inputFile.c_str(), outputFile.c_str());
+    if (targetGroup != -1) printf("Target Group: %d\n", targetGroup);
+    if (numRestarts > 0) printf("Restarts: %d\n", numRestarts);
     printf("SA Iters: %d, BackProp: %s, Earthquake: %d rounds (Strength: %.2f)\n", iterations, doBackProp ? "ON" : "OFF", earthquakeRounds, baseStrength);
     printf("Temp: %.4f -> %.6f\n\n", startTemp, endTemp);
     
@@ -523,7 +538,16 @@ int main(int argc, char** argv) {
     printf("Initial Score: %.6f\n\n", initScore);
     
     vector<int> nvals;
-    for (auto& [n, c] : cfg) nvals.push_back(n);
+    if (targetGroup != -1) {
+        if (cfg.count(targetGroup)) {
+            nvals.push_back(targetGroup);
+        } else {
+            cerr << "Group " << targetGroup << " not found in input!" << endl;
+            return 1;
+        }
+    } else {
+        for (auto& [n, c] : cfg) nvals.push_back(n);
+    }
     
     map<int, Cfg> results;
     for (auto& [n, c] : cfg) results[n] = c;
@@ -538,24 +562,45 @@ int main(int argc, char** argv) {
         Cfg c = cfg[n];
         double oldScore = c.score();
         
-        uint64_t seed = 42 + n * 1000 + idx;
-        Cfg opt = optimizeFull(c, iterations, startTemp, endTemp, seed);
+        Cfg bestOpt = c;
+        double bestOptScore = oldScore;
         
-        if (!opt.anyOvl() && opt.score() < oldScore - 1e-12) {
+        int runs = (numRestarts > 0) ? numRestarts : 1;
+        
+        for (int r = 0; r < runs; r++) {
+            uint64_t seed = 42 + n * 1000 + idx + r * 12345;
+            Cfg opt = optimizeFull(c, iterations, startTemp, endTemp, seed);
+            
+            if (!opt.anyOvl()) {
+                double score = opt.score();
+                if (score < bestOptScore) {
+                    bestOptScore = score;
+                    bestOpt = opt;
+                }
+            }
+        }
+        
+        if (bestOptScore < oldScore - 1e-12) {
             #pragma omp critical
             {
-                results[n] = opt;
+                results[n] = bestOpt;
                 improved++;
-                if (n % 20 == 0) saveCSV(outputFile, results); // Periodic save
-                printf("  N=%3d: %.6f -> %.6f (%.4f%%)\n", n, oldScore, opt.score(), (oldScore - opt.score()) / oldScore * 100);
+                // Save only if running full batch, or maybe just don't save periodically for single group mode to avoid races or IO overhead
+                if (targetGroup == -1 && n % 20 == 0) saveCSV(outputFile, results); 
+                printf("  N=%3d: %.6f -> %.6f (%.4f%%)\n", n, oldScore, bestOptScore, (oldScore - bestOptScore) / oldScore * 100);
                 fflush(stdout);
             }
         }
     }
     
-    // Phase 2: Back Propagation
-    if (doBackProp) {
-        printf("\nPhase 2: Back Propagation (removing trees)...\n");
+    // Only run phases 2 and 3 if operating on all groups, OR if specifically requested?
+    // Earthquakes usually work on the result. If we are doing single group, we probably want earthquake on that group too.
+    // Backprop requires neighbors so it only works if we optimize everything or at least have neighbors.
+    // Assuming single group mode is mostly for independent SA optimization.
+    
+    if (targetGroup == -1 && doBackProp) {
+        // ... (existing backprop code) ...
+         printf("\nPhase 2: Back Propagation (removing trees)...\n");
         
         bool changed = true;
         int pass = 0;
@@ -603,7 +648,7 @@ int main(int argc, char** argv) {
         }
     }
     
-    // Phase 3: Earthquake (perturbation + re-optimize)
+    // Phase 3: Earthquake 
     if (earthquakeRounds > 0) {
         printf("\nPhase 3: Earthquake (%d rounds)...\n", earthquakeRounds);
         
@@ -636,7 +681,8 @@ int main(int argc, char** argv) {
                         if (shaken.side() < results[n].side()) {
                             results[n] = shaken;
                             roundImproved++;
-                            saveCSV(outputFile, results); // Save on earthquake improve
+                            // Only save if full run
+                             if (targetGroup == -1) saveCSV(outputFile, results);
                             printf("    N=%3d: %.6f -> %.6f (%.4f%%)\n", n, c.score(), shaken.score(), (c.score() - shaken.score()) / c.score() * 100);
                             fflush(stdout);
                         }
@@ -651,7 +697,11 @@ int main(int argc, char** argv) {
     double elapsed = chrono::duration_cast<chrono::milliseconds>(t1-t0).count() / 1000.0;
     
     double finalScore = 0;
-    for (auto& [n, c] : results) finalScore += c.score();
+    for (auto& [n, c] : cfg) {
+        // If we only updated one group, use the new result for that group and old results for others to calc score
+        if (results.count(n)) finalScore += results[n].score();
+        else finalScore += c.score(); 
+    }
     
     printf("\n========================================\n");
     printf("Initial: %.6f\n", initScore);
@@ -660,6 +710,9 @@ int main(int argc, char** argv) {
     printf("Time: %.1fs\n", elapsed);
     printf("========================================\n");
     
+    // For single group, we assume the caller wants to see just that group in the output or the full set?
+    // The previous code always dumped everything. 'results' contains everything (copy of cfg) plus updates.
+    // So writing 'results' is correct.
     saveCSV(outputFile, results);
     printf("Saved %s\n", outputFile.c_str());
     
